@@ -38,6 +38,20 @@ export async function POST(req: Request) {
   const now = new Date().toISOString();
 
   // Store raw payload ALWAYS (so we never lose transcript fields)
+  const conversation =
+  payload?.message?.conversation ??
+  payload?.conversation ??
+  payload?.message?.messagesOpenAIFormatted ??
+  null;
+  const messages = payload?.message?.messages ?? payload?.messages ?? null;
+await events.insertOne({
+  callId,
+  eventType,
+  receivedAt: now,
+  conversation,
+  messages,
+  payload,
+});
   await events.insertOne({
     callId,
     eventType,
