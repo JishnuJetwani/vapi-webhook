@@ -5,6 +5,9 @@ import { ObjectId } from "mongodb";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
+/** --------------------------
+ *  Extraction helpers
+ *  -------------------------- */
 function pickCallId(payload: any) {
   return (
     payload?.callId ||
@@ -29,21 +32,11 @@ function pickEventType(payload: any) {
 }
 
 function pickSummary(payload: any) {
-  return payload?.message?.summary || payload?.message?.analysis?.summary || null;
-}
-
-function pickSuccessEvaluation(payload: any) {
-  return (
-    payload?.message?.analysis?.successEvaluation ??
-    payload?.analysis?.successEvaluation ??
-    payload?.message?.successEvaluation ??
-    payload?.successEvaluation ??
-    null
-  );
+  return payload?.message?.analysis?.summary ?? payload?.message?.summary ?? null;
 }
 
 function pickTranscript(payload: any) {
-  return payload?.message?.transcript || payload?.message?.artifact?.transcript || null;
+  return payload?.message?.artifact?.transcript ?? payload?.message?.transcript ?? null;
 }
 
 function pickRecordingUrl(payload: any) {
@@ -51,6 +44,16 @@ function pickRecordingUrl(payload: any) {
     payload?.message?.recordingUrl ||
     payload?.message?.artifact?.recordingUrl ||
     payload?.message?.artifact?.recording?.mono?.combinedUrl ||
+    null
+  );
+}
+
+function pickVapiSuccessEvaluation(payload: any) {
+  return (
+    payload?.message?.analysis?.successEvaluation ??
+    payload?.analysis?.successEvaluation ??
+    payload?.message?.successEvaluation ??
+    payload?.successEvaluation ??
     null
   );
 }
@@ -64,6 +67,96 @@ function pickVars(payload: any) {
   );
 }
 
+/** --------------------------
+ *  Gemini PASS/FAIL
+ *  -------------------------- */
+async function geminiPassFail(args: { summary: string; transcript?: string | null }) {
+  const key = process.env.GEMINI_API_KEY;
+  if (!key) {
+    // If you want “always decisive” even without Gemini, keep fallback below.
+    // But in practice you'll set GEMINI_API_KEY on Vercel.
+    return { verdict: "UNKNOWN" as const, source: "missing_key" as const, raw: "" };
+  }
+
+  // Model can be overridden via env
+  const model = process.env.GEMINI_MODEL || "gemini-1.5-flash";
+
+  // Use summary primarily; transcript optional.
+  const input = [
+    `SUMMARY:\n${args.summary}`,
+    args.transcript ? `\n\nTRANSCRIPT:\n${args.transcript}` : "",
+  ].join("");
+
+  const systemInstruction =
+    `You are evaluating a job reference call.\n` +
+    `Decide if the reference feedback about the candidate should be a PASS or FAIL.\n` +
+    `PASS if the reference is clearly positive / recommends / no concerning red flags.\n` +
+    `FAIL if the reference is negative, refuses to endorse, expresses serious concerns, cannot confirm basic claims, or indicates misconduct.\n` +
+    `Output exactly one word: pass or fail. No punctuation, no extra words.`;
+
+  // Gemini Generative Language API (no extra npm deps)
+  const url =
+    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+      model
+    )}:generateContent?key=${encodeURIComponent(key)}`;
+
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      contents: [
+        {
+          role: "user",
+          parts: [{ text: `${systemInstruction}\n\n${input}` }],
+        },
+      ],
+      generationConfig: {
+        temperature: 0, // make it deterministic
+        maxOutputTokens: 5,
+      },
+    }),
+  });
+
+  const json = await resp.json().catch(() => ({} as any));
+
+  const text: string =
+    json?.candidates?.[0]?.content?.parts?.map((p: any) => p?.text).join("") ??
+    "";
+
+  const cleaned = text.trim().toLowerCase();
+  if (cleaned === "pass") return { verdict: "PASS" as const, source: "gemini" as const, raw: text };
+  if (cleaned === "fail") return { verdict: "FAIL" as const, source: "gemini" as const, raw: text };
+
+  // Fallback heuristic if Gemini responds weirdly (still decisive)
+  const s = args.summary.toLowerCase();
+  const positive =
+    s.includes("positive") ||
+    s.includes("great") ||
+    s.includes("strong") ||
+    s.includes("recommend") ||
+    s.includes("no concerns") ||
+    s.includes("no areas for improvement") ||
+    s.includes("would rehire");
+
+  const negative =
+    s.includes("concern") ||
+    s.includes("warning") ||
+    s.includes("red flag") ||
+    s.includes("would not") ||
+    s.includes("do not recommend") ||
+    s.includes("poor") ||
+    s.includes("unreliable") ||
+    s.includes("dishonest") ||
+    s.includes("misconduct");
+
+  const verdict = negative && !positive ? "FAIL" : "PASS";
+
+  return { verdict, source: "fallback" as const, raw: text };
+}
+
+/** --------------------------
+ *  Handler
+ *  -------------------------- */
 export async function POST(req: Request) {
   // Optional auth
   const expected = process.env.WEBHOOK_TOKEN;
@@ -79,18 +172,10 @@ export async function POST(req: Request) {
   const callId = pickCallId(payload);
   const eventType = pickEventType(payload);
   const summary = pickSummary(payload);
-  const successEvaluation = pickSuccessEvaluation(payload);
   const transcript = pickTranscript(payload);
   const recordingUrl = pickRecordingUrl(payload);
+  const vapiSuccessEvaluation = pickVapiSuccessEvaluation(payload);
   const vars = pickVars(payload);
-
-  const conversation =
-    payload?.message?.conversation ??
-    payload?.conversation ??
-    payload?.message?.messagesOpenAIFormatted ??
-    null;
-
-  const messages = payload?.message?.messages ?? payload?.messages ?? null;
 
   const client = await clientPromise;
   const db = client.db();
@@ -101,32 +186,25 @@ export async function POST(req: Request) {
     callId,
     eventType,
     receivedAt: now,
-    conversation,
-    messages,
     payload,
   });
 
-  // 2) on end-of-call-report: upsert a clean call summary doc + update candidate
+  // 2) On end-of-call-report: upsert clean call + update candidate
   if (eventType === "end-of-call-report" && callId) {
-    const verdict =
-      typeof successEvaluation === "string"
-        ? successEvaluation.toLowerCase() === "true"
-          ? "PASS"
-          : successEvaluation.toLowerCase() === "false"
-            ? "FAIL"
-            : "UNKNOWN"
-        : successEvaluation === true
-          ? "PASS"
-          : successEvaluation === false
-            ? "FAIL"
-            : "UNKNOWN";
+    // 2a) Determine verdict using Gemini (based on SUMMARY, not Vapi successEvaluation)
+    const verdictResult =
+      summary
+        ? await geminiPassFail({ summary, transcript })
+        : { verdict: "FAIL" as const, source: "no_summary" as const, raw: "" };
+
+    const verdict = verdictResult.verdict;
 
     const endedReason = payload?.message?.endedReason ?? null;
     const startedAt = payload?.message?.startedAt ?? null;
     const endedAt = payload?.message?.endedAt ?? null;
     const durationSeconds = payload?.message?.durationSeconds ?? null;
 
-    // 2a) vapi_calls (nice “clean” store)
+    // 2b) vapi_calls (clean store)
     await db.collection("vapi_calls").updateOne(
       { callId },
       {
@@ -136,8 +214,11 @@ export async function POST(req: Request) {
           summary,
           transcript,
           recordingUrl,
-          successEvaluation,
-          verdict,
+          verdict, // GEMINI verdict
+          verdictSource: verdictResult.source,
+          verdictRaw: verdictResult.raw,
+          // keep Vapi's objective-level field for debugging
+          vapiSuccessEvaluation,
           endedReason,
           startedAt,
           endedAt,
@@ -150,11 +231,13 @@ export async function POST(req: Request) {
       { upsert: true }
     );
 
-    // 2b) candidates (THIS is the key glue for your dashboard UI)
+    // 2c) candidates (key glue)
     const candidates = db.collection("candidates");
 
     const candidateIdRaw = typeof vars?.candidate_id === "string" ? vars.candidate_id : null;
 
+    // "Referral responses received" = did we get the call content?
+    // This should be DONE regardless of pass/fail.
     const baseUpdate: any = {
       $set: {
         referenceCall: {
@@ -162,55 +245,45 @@ export async function POST(req: Request) {
           summary,
           transcript,
           recordingUrl,
-          successEvaluation,
-          verdict,
+          verdict,              // GEMINI verdict
+          verdictSource: verdictResult.source,
+          vapiSuccessEvaluation, // keep Vapi field separate
           endedReason,
           startedAt,
           endedAt,
           durationSeconds,
         },
-        status:
-          verdict === "PASS"
-            ? "REF_CALL_PASSED"
-            : verdict === "FAIL"
-              ? "REF_CALL_FAILED"
-              : "REF_CALL_ENDED",
+        status: verdict === "PASS" ? "REF_CALL_PASSED" : "REF_CALL_FAILED",
         stage: "DECISION",
         "tasks.referralContacted": "DONE",
-        "tasks.referralResponses":
-          verdict === "PASS" ? "DONE" : verdict === "FAIL" ? "FAILED" : "WAITING",
+        "tasks.referralResponses": "DONE",
         lastActivityAt: now,
       },
       $push: {
         activity: {
           at: now,
-          label:
-            verdict === "PASS"
-              ? "Reference call ended (PASS)"
-              : verdict === "FAIL"
-                ? "Reference call ended (FAIL)"
-                : "Reference call ended",
+          label: verdict === "PASS" ? "Reference call ended (PASS)" : "Reference call ended (FAIL)",
         },
       },
     };
 
-    // light risk heuristic for “ATS feel”
+    // Risk
     if (verdict === "FAIL") {
       baseUpdate.$set["risk.score"] = 85;
       baseUpdate.$addToSet = { "risk.flags": "Reference flagged concerns" };
-    } else if (verdict === "PASS") {
+    } else {
       baseUpdate.$set["risk.score"] = 15;
     }
 
     let matched = 0;
 
-    // Prefer Mongo _id if present (because you pass candidate_id from start-reference-call)
+    // Prefer Mongo _id match (since you pass candidate_id from start-call)
     if (candidateIdRaw && ObjectId.isValid(candidateIdRaw)) {
       const res = await candidates.updateOne({ _id: new ObjectId(candidateIdRaw) }, baseUpdate);
       matched = res.matchedCount;
     }
 
-    // Fallback: match by vapi.callId stored on candidate
+    // Fallback: match by stored vapi.callId on candidate
     if (matched === 0) {
       await candidates.updateOne({ "vapi.callId": callId }, baseUpdate);
     }
