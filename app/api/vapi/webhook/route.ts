@@ -8,8 +8,10 @@ function pickCallId(payload: any) {
   return (
     payload?.callId ||
     payload?.call?.id ||
-    payload?.call?.callId ||
     payload?.id ||
+    payload?.message?.call?.id ||
+    payload?.message?.callId ||
+    payload?.message?.id ||
     null
   );
 }
